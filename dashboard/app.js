@@ -31,6 +31,26 @@
     if (d < 365) return Math.round(d / 30) + 'mo';
     return (d / 365).toFixed(1) + 'y';
   }
+  /* The factor that most shapes a row's implied value, up or down: the
+     multiplier farthest from 1.00 in log terms. Maturity is a discount
+     (0.60–1.00), so a young protocol's driver reads as a negative. */
+  function driver(r) {
+    var mo = r.model;
+    var cands = [
+      ['Growth', mo.growth_multiplier],
+      ['Chain spread', mo.chain_multiplier],
+      ['Category lead', mo.dominance_multiplier],
+      ['Momentum', mo.momentum_multiplier]
+    ];
+    var best = null, bestAbs = -1;
+    cands.forEach(function (c) {
+      var a = Math.abs(Math.log(c[1]));
+      if (a > bestAbs) { bestAbs = a; best = c; }
+    });
+    if (!best || bestAbs < 0.0005) return 'Size';
+    var p = Math.round((best[1] - 1) * 100);
+    return best[0] + ' ' + (p > 0 ? '+' : '') + p + '%';
+  }
   function bySlug(slug) {
     for (var i = 0; i < D.rows.length; i++) if (D.rows[i].slug === slug) return D.rows[i];
     return null;
@@ -84,7 +104,7 @@
       }).join('');
     }
     return '<section class="panel"><h2>Pre-token board</h2>' +
-      '<p>Ranked by implied value, model radar-4. <span class="badge">Watchlist</span> marks the 40 protocols on the snapshot watchlist; the rest are the early finds below the $50M floor that pass the same no-token test — no wrapped, staked or bridged product. Every protocol here records no token.</p>' +
+      '<p>Ranked by implied value, model radar-5. <span class="badge">Watchlist</span> marks the 40 protocols on the snapshot watchlist; the rest are the early finds below the $50M floor that pass the same no-token test — no wrapped, staked or bridged product. Every protocol here records no token. <strong>Driver</strong> names the factor beyond size and age that most shapes each row\u2019s value, up or down: the age column already shows maturity, so the driver is the strongest of growth, chain spread, category lead and category momentum.</p>' +
       '<div class="filters">' +
       '<label>Search<input id="f-q" type="search" placeholder="Name or slug" value="' + esc(f.q || '') + '"></label>' +
       '<label>Category<select id="f-cat">' + opts(cats, f.cat, 'All categories') + '</select></label>' +
@@ -103,6 +123,7 @@
       '<th class="num"><button data-sort="change_7d">7d</button></th>' +
       '<th class="num"><button data-sort="age_days">Age</button></th>' +
       '<th class="num"><button data-sort="implied_value_usd">Implied value</button></th>' +
+      '<th>Driver</th>' +
       '</tr></thead><tbody id="rows"></tbody></table></div>';
   }
 
@@ -143,8 +164,9 @@
           '<td class="num">' + money(r.tvl_usd) + '</td>' +
           '<td class="num">' + pct(r.change_7d) + '</td>' +
           '<td class="num">' + ageText(r.age_days) + '</td>' +
-          '<td class="num"><strong>' + money(r.implied_value_usd) + '</strong></td></tr>';
-      }).join('') || '<tr><td colspan="8">No protocol matches these filters. Loosen one and try again.</td></tr>';
+          '<td class="num"><strong>' + money(r.implied_value_usd) + '</strong></td>' +
+          '<td>' + esc(driver(r)) + '</td></tr>';
+      }).join('') || '<tr><td colspan="9">No protocol matches these filters. Loosen one and try again.</td></tr>';
     }
     function syncHash() {
       var parts = [];
@@ -192,20 +214,21 @@
   function renderModel() {
     tabOn('tab-model');
     var m = D.model;
-    app.innerHTML = '<section class="panel"><h2>How the model works — radar-4</h2>' +
+    app.innerHTML = '<section class="panel"><h2>How the model works — radar-5</h2>' +
       '<p>One formula scores every protocol, from the snapshot\u2019s own figures only. No name is ever special-cased: two protocols with the same figures get the same value.</p>' +
       '<pre class="formula">' + esc(D.model_formula) + '</pre>' +
       '<table class="factors"><thead><tr><th>Factor</th><th>What it is</th><th>Range</th></tr></thead><tbody>' +
       '<tr><td>Base</td><td>TVL x ' + m.base_multiple + ' — size is the anchor: a bigger protocol supports a bigger launch.</td><td>TVL x 0.25</td></tr>' +
       '<tr><td>Growth</td><td>7-day TVL change, clamped to ' + m.growth_floor + '% .. +' + m.growth_cap + '%, weighted ' + m.growth_weight + ' — momentum, capped so one wild week cannot dominate.</td><td>' + (1 + m.growth_floor / 100 * m.growth_weight).toFixed(2) + ' – ' + (1 + m.growth_cap / 100 * m.growth_weight).toFixed(2) + '</td></tr>' +
       '<tr><td>Maturity</td><td>Age from listed_at to ' + esc(D.as_of) + ' (365 days when unlisted), capped at ' + m.maturity_days + ' days — surviving longer with no token earns trust, up to a point.</td><td>' + m.maturity_floor + ' – ' + (m.maturity_floor + m.maturity_range).toFixed(1) + '</td></tr>' +
-      '<tr><td>Chain spread</td><td>1% per extra chain beyond the first, capped at +' + (m.chain_max_extra * m.chain_step * 100) + '% — wider distribution means more places a launch can land. Added in radar-2, deliberately small so it breaks near-ties but never outranks TVL.</td><td>1.00 – 1.09</td></tr>' +
-      '<tr><td>Category lead</td><td>Share of the protocol\u2019s own category TVL, capped at ' + (m.dominance_cap * 100) + '% share and weighted ' + m.dominance_weight + ', only when the category holds ' + m.dominance_min_category + ' or more protocols in the snapshot — a category flagship is the most likely launch candidate in its category. Added in radar-4, deliberately small so it rewards a real lead but never outranks TVL.</td><td>1.00 – 1.05</td></tr>' +
+      '<tr><td>Chain spread</td><td>1% per extra chain beyond the first, capped at +' + (m.chain_max_extra * m.chain_step * 100) + '% — wider distribution means more places a launch can land. Added in radar-2, raised to ' + m.chain_max_extra + ' extra chains in radar-5 because 13 board rows sit on more than 10 chains and were all capped at the old +9%.</td><td>1.00 – ' + (1 + m.chain_max_extra * m.chain_step).toFixed(2) + '</td></tr>' +
+      '<tr><td>Category lead</td><td>Share of the protocol\u2019s own category TVL, capped at ' + (m.dominance_cap * 100) + '% share and weighted ' + m.dominance_weight + ', only when the category holds ' + m.dominance_min_category + ' or more protocols in the snapshot — a category flagship is the most likely launch candidate in its category. Added in radar-4, deliberately small so it rewards a real lead but never outranks TVL.</td><td>1.00 – ' + (1 + m.dominance_cap * m.dominance_weight).toFixed(2) + '</td></tr>' +
+      '<tr><td>Category momentum</td><td>The protocol\u2019s 7-day change minus its own category\u2019s median 7-day change, capped at ' + (m.momentum_cap * 100) + ' points either way, only when the change is reported and the category holds ' + m.momentum_min_category + ' or more protocols with a reported change — absolute growth mixes category beta with protocol alpha, so a protocol outgrowing its own category is the stronger signal. Added in radar-5.</td><td>' + (1 - m.momentum_cap).toFixed(2) + ' – ' + (1 + m.momentum_cap).toFixed(2) + '</td></tr>' +
       '</tbody></table>' +
       '<p>Ties that remain break by TVL, then by slug, so the order is fully deterministic. The board ranks ' + D.board_size + ' protocols: all ' + D.watchlist_size + ' on the watchlist plus ' + D.early_size + ' early pre-token protocols below the ' + money(D.floor_usd) + ' floor. Live-token protocols are excluded from ranking and shown at market cap instead.</p>' +
-      '<p>This is not a TVL table: ' + D.rank_moved_5plus + ' of the ' + D.board_size + ' rows sit 5 or more places from where TVL alone would put them, because growth, age, chain spread and category lead move the order. radar-4 adds the category-lead factor to the radar-3 formula; it moves 14 of ' + D.board_size + ' ranks and none of the top 5.</p>' +
+      '<p>This is not a TVL table: ' + D.rank_moved_5plus + ' of the ' + D.board_size + ' rows sit 5 or more places from where TVL alone would put them, because growth, age, chain spread, category lead and category momentum move the order. radar-5 changes the radar-4 order: ' + D.vs_prev_moved + ' of ' + D.board_size + ' rows move, ' + D.vs_prev_moved_5plus + ' by 5 or more places' + (D.vs_prev_top5_same ? ', and the top 5 keep their order.' : ', and even the top 5 change order.') + '</p>' +
       '<p>Who is left out, and why. A wrapped, staked or bridged product of a token that already trades is not a protocol still waiting on a launch, so the watchlist\u2019s own test applies to every row, not just the watchlist: ' + D.excluded_visible + ' pre-token protocols are left out by that test (centralised exchanges, bridges, liquid staking and restaking, versioned pools, wrapped or staked names, exchange products). ' + D.excluded_house + ' more are left out only by the watchlist itself: the house sees each protocol\u2019s parent protocol, which this snapshot does not carry, so above the floor the watchlist is authoritative.</p>' +
-      '<p>Farm plans are built per category from the same figures: capital tiers follow TVL ($50 / $100 / $150 / $250), the hold window follows age (60 / 45 / 30 days), the actions follow the category and the chains, and step 5 is a risk check written from the protocol\u2019s own 7-day change, age, chain count and TVL — a sharp fall, a steady fall, a surge, a long wait, a young protocol, a slow drift, a single-chain position, a thin TVL, missing momentum data, a wide chain spread, or a steady state that still names its own figures. ' + D.generic_risk_steps + ' of the ' + D.board_size + ' risk steps are generic.</p></section>';
+      '<p>Farm plans are built per category from the same figures: capital tiers follow TVL ($50 / $100 / $150 / $250), the hold window follows age (60 / 45 / 30 days), the actions follow the category and the chains, and step 5 is a risk check written from the protocol\u2019s own 7-day change, age, chain count and TVL — a sharp fall, a steady fall, a surge, a long wait, a young protocol, a slow drift, a single-chain position, a thin TVL, missing momentum data, a wide chain spread, or a steady state that still names its own figures — and, on every momentum branch, the protocol\u2019s own category\u2019s median change, so the step says whether the move is the category\u2019s move or this protocol\u2019s own. Steps 1, 6 and 7 name the protocol\u2019s own chain, capital and hold window instead of repeating one shared text. ' + D.generic_risk_steps + ' of the ' + D.board_size + ' risk steps are generic.</p></section>';
   }
 
   /* ---------- Detail view ---------- */
@@ -231,14 +254,15 @@
       '<div><dt>Listed</dt><dd>' + esc(r.listed_at || 'unknown') + '</dd></div>' +
       '<div><dt>Chains</dt><dd>' + mo.chain_count + '</dd></div></dl>' +
       '<div class="detail-cols"><div>' +
-      '<h2>Model breakdown — radar-4</h2>' +
+      '<h2>Model breakdown — radar-5</h2>' +
       '<table class="factors"><thead><tr><th>Factor</th><th class="num">Value</th><th>How it was computed</th></tr></thead><tbody>' +
       share('Base', money(mo.base_usd), 'TVL ' + money(r.tvl_usd) + ' x 0.25') +
       share('Growth', 'x' + mo.growth_multiplier, '7-day change ' + (r.change_7d == null ? 'unreported (0%)' : r.change_7d.toFixed(2) + '%') + ', clamped to -60% .. +120%') +
       share('Maturity', 'x' + mo.maturity_multiplier, 'age ' + (mo.age_days == null ? 'unknown, counted as 365 days' : mo.age_days + ' days') + ', capped at 1,095 days') +
-      share('Chain spread', 'x' + mo.chain_multiplier, mo.chain_count + ' chain' + (mo.chain_count === 1 ? '' : 's') + ' — 1% per extra chain, capped at +9%') +
+      share('Chain spread', 'x' + mo.chain_multiplier, mo.chain_count + ' chain' + (mo.chain_count === 1 ? '' : 's') + ' — 1% per extra chain, capped at +15%') +
       share('Category lead', 'x' + mo.dominance_multiplier, (mo.category_share * 100).toFixed(1) + '% of ' + esc(r.category || 'its category') + ' TVL (' + mo.category_size + ' protocols) — capped at 50% share, only when the category holds 3+ protocols') +
-      share('Implied value', money(r.implied_value_usd), 'base x growth x maturity x chain spread x category lead, rounded to the dollar') +
+      share('Category momentum', 'x' + mo.momentum_multiplier, mo.category_median_change == null ? '7-day change unreported, or the category too thin for a median — no adjustment' : '7-day change ' + (r.change_7d == null ? 'unreported' : r.change_7d.toFixed(2) + '%') + ' against a category median of ' + (mo.category_median_change >= 0 ? '+' : '') + mo.category_median_change.toFixed(1) + '% — capped at -10..+10 points') +
+      share('Implied value', money(r.implied_value_usd), 'base x growth x maturity x chain spread x category lead x category momentum, rounded to the dollar') +
       '</tbody></table>' +
       '</div><div>' +
       '<h2>Farm plan — 7 steps</h2>' +

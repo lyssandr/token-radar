@@ -28,37 +28,62 @@
 // carry parentProtocol, so above the floor the watchlist itself stays
 // authoritative and those protocols stay out.
 //
-// Implied value, radar-4, from the snapshot's own figures only. No protocol
-// name is ever special-cased; the same function scores every row. radar-4
-// keeps the radar-3 formula and adds exactly one factor, category lead:
-// a protocol that holds a large share of its own category's TVL is that
-// category's flagship, and a flagship is the most likely launch candidate
-// in its category. The factor is deliberately small (up to +5%, only when
-// the category holds 3 or more protocols in the snapshot, so a one-protocol
-// category cannot manufacture a lead) and it moves 14 of 178 ranks, none
-// of the top 5. The formula is unchanged from radar-2 in every other way:
-// the snapshot shows it already moves the ranking well away from a TVL
-// table (138 of 226 radar-2 rows sat 5 or more places from their TVL-only
-// rank), so there was nothing to fix there.
+// Implied value, radar-5, from the snapshot's own figures only. No protocol
+// name is ever special-cased; the same function scores every row. radar-5
+// keeps the radar-4 formula and adds exactly two things, both measured on
+// the snapshot before they were kept:
+//   (1) category momentum: a protocol's 7-day growth minus its own
+//       category's median 7-day growth, clamped to -10..+10 points and
+//       weighted 1-for-1. Absolute growth mixes category beta with
+//       protocol alpha: a DEX up 5% in a flat category is outperforming
+//       its market, while a protocol up 5% in a category whose median is
+//       +20% is lagging it. The median is taken over every protocol in
+//       the category with a reported change, live-token ones included, so
+//       it is the category's own market, not the board's. 162 of 178 rows
+//       get a non-1.00 factor (102 up and 55 down by 0.1% or more; 5 more
+//       move by less than 0.1%); 22 beat their category median by more
+//       than 10 points. It moves 131 of 178 ranks against radar-4 and
+//       none of the top 5.
+//   (2) chain spread cap raised from 9 to 15 extra chains. 13 board rows
+//       sit on more than 10 chains (up to 45) and were all capped at +9%,
+//       so the factor could not tell a 10-chain protocol from a 45-chain
+//       one. +15% still cannot outrank TVL. It moves 15 rows, 1 by 5 or
+//       more places; the top 10 are unchanged.
+// radar-4 added category lead: a protocol that holds a large share of
+// its own category's TVL is that category's flagship, and a flagship is
+// the most likely launch candidate in its category. The factor is
+// deliberately small (up to +5%, only when the category holds 3 or more
+// protocols in the snapshot, so a one-protocol category cannot
+// manufacture a lead) and it moves 14 of 178 ranks, none of the top 5.
+// The formula is unchanged from radar-2 in every other way: the snapshot
+// shows it already moves the ranking well away from a TVL table (138 of
+// 226 radar-2 rows sat 5 or more places from their TVL-only rank), so
+// there was nothing to fix there.
 //
 //   base         = tvl_usd x 0.25
 //   growth       = clamp(change_7d, -60, 120) per cent (0 when unreported)
 //   growthMult   = 1 + (growth / 100) x 0.5
 //   age          = days from listed_at to as_of (365 when listed_at is null)
 //   maturityMult = 0.6 + min(age, 1095) / 1095 x 0.4
-//   chainMult    = 1 + min(max(chains - 1, 0), 9) x 0.01   (1.00 to 1.09)
+//   chainMult    = 1 + min(max(chains - 1, 0), 15) x 0.01   (1.00 to 1.15)
 //   share        = tvl_usd / total TVL of the protocol's category
 //   dominanceMult = 1 + min(share, 0.5) x 0.1 when the category holds
 //                  3+ protocols, else 1.00                 (1.00 to 1.05)
+//   catMedian    = median change_7d of the protocol's category (all
+//                  protocols with a reported change, live ones included)
+//   momentumMult = 1 + clamp(change_7d - catMedian, -10, +10) / 100
+//                  when change_7d is reported and the category holds
+//                  3+ protocols with a reported change, else 1.00
+//                                                      (0.90 to 1.10)
 //   implied      = max(1, round(base x growthMult x maturityMult
-//                               x chainMult x dominanceMult))
+//                               x chainMult x dominanceMult x momentumMult))
 //
 // The first three factors are the starter's base model, kept unchanged so the
 // value stays comparable: size (TVL), momentum (7-day growth) and survival
 // (age with no token). radar-2 adds exactly one factor, chain diversity:
 // a protocol live on more chains has wider distribution and more places a
 // launch can land, so it earns up to +9%. The factor is deliberately small
-// (1% per extra chain, capped at 9 extra chains) so it can break near-ties
+// (1% per extra chain, capped at 15 extra chains) so it can break near-ties
 // and reward genuinely multi-chain protocols, but can never outrank TVL.
 // Ties that remain are broken by TVL, then by slug, so the order is fully
 // deterministic and reproducible from the snapshot alone.
@@ -98,6 +123,9 @@ export interface ModelConstants {
   dominance_weight: number;
   dominance_cap: number;
   dominance_min_category: number;
+  momentum_weight: number;
+  momentum_cap: number;
+  momentum_min_category: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -110,13 +138,24 @@ export const MODEL: ModelConstants = {
   maturity_days: 1095,
   unknown_age_days: 365,
   chain_step: 0.01,
-  chain_max_extra: 9,
+  chain_max_extra: 15,
   dominance_weight: 0.1,
   dominance_cap: 0.5,
   dominance_min_category: 3,
+  momentum_weight: 1,
+  momentum_cap: 0.1,
+  momentum_min_category: 3,
 };
 
-export const MODEL_VERSION = 'radar-4';
+/** radar-4's constants, for the honest vs-previous comparison in buildRadar:
+ *  same formula, chain cap 9, no momentum factor. */
+export const RADAR4_MODEL: ModelConstants = {
+  ...MODEL,
+  chain_max_extra: 9,
+  momentum_weight: 0,
+};
+
+export const MODEL_VERSION = 'radar-5';
 
 /** Live-token view: the largest live protocols by market cap. */
 export const LIVE_ROWS = 24;
@@ -138,6 +177,8 @@ export interface ModelBreakdown {
   dominance_multiplier: number;
   category_share: number;
   category_size: number;
+  momentum_multiplier: number;
+  category_median_change: number | null;
 }
 
 export interface BoardRow {
@@ -206,6 +247,13 @@ export interface RadarData {
   rank_moved_5plus: number;
   /** Risk steps (farm step 5) that carry no figure from the protocol's own record: 0 in radar-4, every branch names its figures. */
   generic_risk_steps: number;
+  /** Honest comparison against the radar-4 board, computed on every run
+   *  from the same snapshot: rows whose rank differs, rows moved 5+ places,
+   *  and whether the top 5 / top 10 keep their order. */
+  vs_prev_moved: number;
+  vs_prev_moved_5plus: number;
+  vs_prev_top5_same: boolean;
+  vs_prev_top10_same: boolean;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -251,12 +299,42 @@ export function categoryStats(snapshot: Snapshot): Map<string, CategoryStats> {
   return stats;
 }
 
-/** radar-4 scoring of one protocol, with every factor exposed for the detail view. */
+/**
+ * Per-category median 7-day change, for the category-momentum factor.
+ * The median is taken over every protocol in the category with a reported
+ * change_7d, live-token ones included: it is the category's own market
+ * momentum, not the board's. The count is the number of protocols that
+ * reported a change, since only those can anchor a median.
+ */
+export interface CategoryMedian {
+  median_change: number;
+  reported: number;
+}
+
+export function categoryMedians(snapshot: Snapshot): Map<string, CategoryMedian> {
+  const byCat = new Map<string, number[]>();
+  for (const p of snapshot.protocols) {
+    if (p.change_7d === null) continue;
+    const key = p.category ?? '';
+    const arr = byCat.get(key) ?? [];
+    arr.push(p.change_7d);
+    byCat.set(key, arr);
+  }
+  const out = new Map<string, CategoryMedian>();
+  for (const [key, arr] of byCat) {
+    arr.sort((a, b) => a - b);
+    out.set(key, { median_change: arr[Math.floor(arr.length / 2)]!, reported: arr.length });
+  }
+  return out;
+}
+
+/** radar-5 scoring of one protocol, with every factor exposed for the detail view. */
 export function impliedValue(
   p: SnapshotProtocol,
   asOf: string,
   model: ModelConstants = MODEL,
   cats: Map<string, CategoryStats> | null = null,
+  medians: Map<string, CategoryMedian> | null = null,
 ): { implied: number; breakdown: ModelBreakdown } {
   const age = ageDays(asOf, p.listed_at);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(p.change_7d, 0)));
@@ -275,8 +353,23 @@ export function impliedValue(
     categorySize >= model.dominance_min_category
       ? 1 + Math.min(categoryShare, model.dominance_cap) * model.dominance_weight
       : 1;
+  // Category momentum, radar-5: the protocol's 7-day growth minus its own
+  // category's median 7-day growth. Only when the change is reported and
+  // the category holds 3+ protocols with a reported change, so a thin
+  // category cannot manufacture momentum out of one peer. The adjustment
+  // is capped at -10..+10 points, so it rewards real outperformance
+  // without letting one week rewrite the board.
+  const med = medians?.get(p.category ?? '');
+  const categoryMedianChange =
+    p.change_7d !== null && med !== undefined && med.reported >= model.momentum_min_category
+      ? round4(med.median_change)
+      : null;
+  const momentumMult =
+    categoryMedianChange !== null
+      ? 1 + Math.min(model.momentum_cap, Math.max(-model.momentum_cap, (p.change_7d! - categoryMedianChange) / 100)) * model.momentum_weight
+      : 1;
   const base = p.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult * dominanceMult));
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult * dominanceMult * momentumMult));
   return {
     implied,
     breakdown: {
@@ -290,6 +383,8 @@ export function impliedValue(
       dominance_multiplier: round4(dominanceMult),
       category_share: round4(categoryShare),
       category_size: categorySize,
+      momentum_multiplier: round4(momentumMult),
+      category_median_change: categoryMedianChange,
     },
   };
 }
@@ -360,8 +455,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const cats = categoryStats(snapshot);
+  const medians = categoryMedians(snapshot);
   const scored = [...chosen.values()].map((p) => {
-    const { implied, breakdown } = impliedValue(p, snapshot.as_of, model, cats);
+    const { implied, breakdown } = impliedValue(p, snapshot.as_of, model, cats, medians);
     return { p, implied, breakdown };
   });
   // Rank by implied value; exact ties break by TVL, then slug: deterministic.
@@ -383,7 +479,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.breakdown.age_days,
     implied_value_usd: s.implied,
     model: s.breakdown,
-    farm_steps: farmSteps(s.p, s.breakdown.age_days).map(stepText),
+    farm_steps: farmSteps(s.p, s.breakdown.age_days, medians).map(stepText),
   }));
 }
 
@@ -476,37 +572,51 @@ function moneyShort(n: number): string {
 }
 
 /**
- * The risk check, radar-4: one step that only this protocol's own figures
- * can write. radar-3 had four signals (a falling TVL, a surging TVL, a very
- * long wait with no token, a wide chain spread) and 113 of 178 rows fell
- * through to a generic announcement check. radar-4 reads every figure the
- * snapshot carries, in priority order, so each row gets the risk that
- * actually applies to it: a sharp fall, a steady fall, a surge, a long wait,
- * a young protocol, a slow TVL drift, a single-chain position, a thin TVL,
- * missing momentum data, or a wide chain spread. The last branch is the
- * steady state, and it still names the row's own figures (its 7-day change,
- * its age, its chain count), so no row ends on a generic step.
+ * The risk check, radar-5: one step that only this protocol's own figures
+ * can write. radar-4 reads every figure the snapshot carries, in priority
+ * order, so each row gets the risk that actually applies to it: a sharp
+ * fall, a steady fall, a surge, a long wait, a young protocol, a slow TVL
+ * drift, a single-chain position, a thin TVL, missing momentum data, or a
+ * wide chain spread. The last branch is the steady state, and it still
+ * names the row's own figures (its 7-day change, its age, its chain
+ * count), so no row ends on a generic step. radar-5 adds one more figure
+ * to every momentum branch (sharp fall, fall, surge, drift, steady): the
+ * protocol's own category's median 7-day change, so the step says whether
+ * the move is the category's move or this protocol's own. A protocol
+ * falling while its category rises is a different risk from a protocol
+ * falling with its category.
  */
-function riskStep(p: SnapshotProtocol, age: number | null, capital: number): FarmStep {
+function riskStep(p: SnapshotProtocol, age: number | null, capital: number, catMedian: number | null): FarmStep {
   const change = p.change_7d;
   const chains = Array.isArray(p.chains) ? p.chains.length : 0;
+  /** The category context clause, or '' when the category has no median. */
+  const medianClause = (dir: 'fall' | 'rise'): string => {
+    if (catMedian === null || change === null) return '';
+    const m = `${catMedian >= 0 ? '+' : ''}${catMedian.toFixed(1)}%`;
+    if (dir === 'fall') {
+      const sharper = change <= catMedian - 10;
+      return ` Its category's median moved ${m} in the same week, so this fall is ${sharper ? 'sharper than its category' : 'in line with its category'}.`;
+    }
+    const ahead = change >= catMedian + 10;
+    return ` Its category's median moved ${m} in the same week, so this rise is ${ahead ? 'ahead of its category' : 'in line with its category'}.`;
+  };
   if (change !== null && change <= -25) {
     return {
-      text: `TVL fell sharply, ${Math.abs(change).toFixed(1)}% in the last 7 days: stop adding capital, keep only the $${capital} already in, and do not top it up until two snapshots in a row show the fall stopping.`,
+      text: `TVL fell sharply, ${Math.abs(change).toFixed(1)}% in the last 7 days: stop adding capital, keep only the $${capital} already in, and do not top it up until two snapshots in a row show the fall stopping.${medianClause('fall')}`,
       cost: 'no new capital; about $2 of gas to check',
       time: '10 minutes a week until the fall stops',
     };
   }
   if (change !== null && change <= -10) {
     return {
-      text: `TVL fell ${Math.abs(change).toFixed(1)}% in the last 7 days, so do not add more capital yet: keep the $${capital} position, check the protocol's own announcements for the cause, and only top it up if the next snapshot shows the fall reversing.`,
+      text: `TVL fell ${Math.abs(change).toFixed(1)}% in the last 7 days, so do not add more capital yet: keep the $${capital} position, check the protocol's own announcements for the cause, and only top it up if the next snapshot shows the fall reversing.${medianClause('fall')}`,
       cost: 'no new capital; about $2 of gas to check',
       time: '10 minutes a week until the fall reverses',
     };
   }
   if (change !== null && change >= 20) {
     return {
-      text: `TVL rose ${change.toFixed(1)}% in 7 days, so momentum is strong, but do not chase it with more than the planned $${capital}: a fast rise can reverse before the next snapshot, so keep the position as planned and re-check in a week.`,
+      text: `TVL rose ${change.toFixed(1)}% in 7 days, so momentum is strong, but do not chase it with more than the planned $${capital}: a fast rise can reverse before the next snapshot, so keep the position as planned and re-check in a week.${medianClause('rise')}`,
       cost: `no new capital beyond the planned $${capital}`,
       time: '10 minutes a week',
     };
@@ -527,7 +637,7 @@ function riskStep(p: SnapshotProtocol, age: number | null, capital: number): Far
   }
   if (change !== null && change < 0) {
     return {
-      text: `TVL drifted down ${Math.abs(change).toFixed(1)}% in the last 7 days: not a crash, but a slow bleed, so hold the $${capital} position, add nothing, and check again next week; two more down weeks in a row means the protocol is cooling off.`,
+      text: `TVL drifted down ${Math.abs(change).toFixed(1)}% in the last 7 days: not a crash, but a slow bleed, so hold the $${capital} position, add nothing, and check again next week; two more down weeks in a row means the protocol is cooling off.${medianClause('fall')}`,
       cost: 'no new capital; about $2 of gas to check',
       time: '10 minutes a week',
     };
@@ -563,7 +673,7 @@ function riskStep(p: SnapshotProtocol, age: number | null, capital: number): Far
   const ageText = age === null ? 'listed at an unknown date' : `listed ${age} days ago`;
   const changeText = change === null ? 'unreported' : `${change > 0 ? '+' : ''}${change.toFixed(1)}%`;
   return {
-    text: `No warning in the snapshot: TVL moved ${changeText} in 7 days, ${ageText} with no token, and live on ${chains} chains. The risk is a quiet wind-down, so check the protocol's own announcements once a week; a slow protocol can stop without a visible TVL fall.`,
+    text: `No warning in the snapshot: TVL moved ${changeText} in 7 days, ${ageText} with no token, and live on ${chains} chains. The risk is a quiet wind-down, so check the protocol's own announcements once a week; a slow protocol can stop without a visible TVL fall.${medianClause('rise')}`,
     cost: 'nothing to check',
     time: '5 minutes a week',
   };
@@ -573,16 +683,26 @@ function riskStep(p: SnapshotProtocol, age: number | null, capital: number): Far
  * Seven concrete farm steps, derived from the protocol's own record (category,
  * chains, TVL, age, 7-day change). Never per-name: two protocols in one category with
  * the same figures get the same plan shape, differing only in name, chain and size.
+ * radar-5: steps 1, 6 and 7 were identical across all 178 rows in radar-4
+ * (step 6 and step 7 literally one text each), so a reader opening two
+ * detail views saw the same words twice. They now name the protocol's own
+ * chain, capital and hold window, so every step carries a figure from the
+ * row it belongs to.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, medians: Map<string, CategoryMedian> | null = null): FarmStep[] {
   const chain = chainOf(p);
   const chains = chainList(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const gas = capital >= 150 ? 8 : 4;
+  const med = medians?.get(p.category ?? '');
+  const catMedian =
+    p.change_7d !== null && med !== undefined && med.reported >= MODEL.momentum_min_category
+      ? round4(med.median_change)
+      : null;
   return [
     {
-      text: `Use a fresh wallet that holds only the $${capital} you plan to farm, and write its seed phrase on paper and store it offline.`,
+      text: `Use a fresh wallet on ${chain} that holds only the $${capital} you plan to farm, and write its seed phrase on paper and store it offline.`,
       cost: 'under $3 of gas for the first transaction',
       time: '5 minutes',
     },
@@ -601,14 +721,14 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: `the $${capital} stays locked in the position`,
       time: `${hold} days`,
     },
-    riskStep(p, age, capital),
+    riskStep(p, age, capital, catMedian),
     {
-      text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes; never pay a fee to claim and never trust a link from a direct message.`,
+      text: `Before you withdraw the $${capital} from ${chain}, open the protocol's own points or rewards page and claim only from the link it publishes; never pay a fee to claim and never trust a link from a direct message.`,
       cost: 'no fee to check, and never pay to claim',
       time: '10 minutes',
     },
     {
-      text: `Write the wallet address, the deposit date and every transaction hash in a farm log, then plan the exit: withdraw in two parts a week apart so a late snapshot still catches the position.`,
+      text: `Write the wallet address, the deposit date and every transaction hash in a farm log, then plan the exit: after the ${hold}-day hold, withdraw the $${capital} in two parts a week apart so a late snapshot still catches the position on ${chain}.`,
       cost: 'nothing but the log',
       time: '5 minutes',
     },
@@ -655,6 +775,21 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const live = liveRows(snapshot);
   const early = board.filter((r) => !r.watchlist).length;
   const boardSlugs = new Set(board.map((r) => r.slug));
+  // Honest comparison against the radar-4 board, from the same snapshot:
+  // score the same rows with radar-4's constants and count rank moves.
+  const prev = buildBoard(snapshot, RADAR4_MODEL);
+  const prevRank = new Map(prev.map((r) => [r.slug, r.rank]));
+  let vsPrevMoved = 0;
+  let vsPrevMoved5plus = 0;
+  for (const r of board) {
+    const d = Math.abs(r.rank - (prevRank.get(r.slug) ?? r.rank));
+    if (d > 0) vsPrevMoved++;
+    if (d >= 5) vsPrevMoved5plus++;
+  }
+  const top5 = (rows: BoardRow[]): string => rows.slice(0, 5).map((r) => r.slug).join(',');
+  const top10 = (rows: BoardRow[]): string => rows.slice(0, 10).map((r) => r.slug).join(',');
+  const vsPrevTop5Same = top5(board) === top5(prev);
+  const vsPrevTop10Same = top10(board) === top10(prev);
   // Coverage accounting, for the model tab: every pre-token protocol the
   // board leaves out, split by whether this snapshot can explain why.
   let excludedVisible = 0;
@@ -679,7 +814,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
-    model_formula: 'implied = TVL x 0.25 x (1 + clamp(change_7d, -60, 120) / 100 x 0.5) x (0.6 + min(age, 1095) / 1095 x 0.4) x (1 + min(chains - 1, 9) x 0.01) x (1 + min(category share, 0.5) x 0.1, only when the category holds 3+ protocols)',
+    model_formula: 'implied = TVL x 0.25 x (1 + clamp(change_7d, -60, 120) / 100 x 0.5) x (0.6 + min(age, 1095) / 1095 x 0.4) x (1 + min(chains - 1, 15) x 0.01) x (1 + min(category share, 0.5) x 0.1, only when the category holds 3+ protocols) x (1 + clamp(change_7d - category median change, -10, +10) / 100, category momentum, only when change is reported and the category holds 3+ protocols with a reported change)',
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
@@ -689,6 +824,10 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     excluded_house: excludedHouse,
     rank_moved_5plus: rankMoved5plus,
     generic_risk_steps: genericRiskSteps,
+    vs_prev_moved: vsPrevMoved,
+    vs_prev_moved_5plus: vsPrevMoved5plus,
+    vs_prev_top5_same: vsPrevTop5Same,
+    vs_prev_top10_same: vsPrevTop10Same,
     rows: board.map(radarRow),
     live,
   };
