@@ -1,4 +1,4 @@
-// Token Radar (model radar-3): snapshot in, ranked board + dashboard out.
+// Token Radar (model radar-4): snapshot in, ranked board + dashboard out.
 //
 // Usage (outside the grader):  mkdir -p out && MAKEFUN_OUTPUT_DIR=out \
 //   node main.ts --input <kit>/input/snapshot.json

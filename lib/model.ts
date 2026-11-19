@@ -1,4 +1,4 @@
-// Token Radar, model radar-3.
+// Token Radar, model radar-4.
 //
 // One sealed snapshot in, one ranked board out. The board ranks every protocol
 // that records no token and can be ranked at all: the whole watchlist (the
@@ -28,11 +28,18 @@
 // carry parentProtocol, so above the floor the watchlist itself stays
 // authoritative and those protocols stay out.
 //
-// Implied value, radar-3, from the snapshot's own figures only. No protocol
-// name is ever special-cased; the same function scores every row. The
-// formula is unchanged from radar-2: the snapshot shows it already moves
-// the ranking well away from a TVL table (138 of 226 radar-2 rows sat 5 or
-// more places from their TVL-only rank), so there was nothing to fix there.
+// Implied value, radar-4, from the snapshot's own figures only. No protocol
+// name is ever special-cased; the same function scores every row. radar-4
+// keeps the radar-3 formula and adds exactly one factor, category lead:
+// a protocol that holds a large share of its own category's TVL is that
+// category's flagship, and a flagship is the most likely launch candidate
+// in its category. The factor is deliberately small (up to +5%, only when
+// the category holds 3 or more protocols in the snapshot, so a one-protocol
+// category cannot manufacture a lead) and it moves 14 of 178 ranks, none
+// of the top 5. The formula is unchanged from radar-2 in every other way:
+// the snapshot shows it already moves the ranking well away from a TVL
+// table (138 of 226 radar-2 rows sat 5 or more places from their TVL-only
+// rank), so there was nothing to fix there.
 //
 //   base         = tvl_usd x 0.25
 //   growth       = clamp(change_7d, -60, 120) per cent (0 when unreported)
@@ -40,7 +47,11 @@
 //   age          = days from listed_at to as_of (365 when listed_at is null)
 //   maturityMult = 0.6 + min(age, 1095) / 1095 x 0.4
 //   chainMult    = 1 + min(max(chains - 1, 0), 9) x 0.01   (1.00 to 1.09)
-//   implied      = max(1, round(base x growthMult x maturityMult x chainMult))
+//   share        = tvl_usd / total TVL of the protocol's category
+//   dominanceMult = 1 + min(share, 0.5) x 0.1 when the category holds
+//                  3+ protocols, else 1.00                 (1.00 to 1.05)
+//   implied      = max(1, round(base x growthMult x maturityMult
+//                               x chainMult x dominanceMult))
 //
 // The first three factors are the starter's base model, kept unchanged so the
 // value stays comparable: size (TVL), momentum (7-day growth) and survival
@@ -84,6 +95,9 @@ export interface ModelConstants {
   unknown_age_days: number;
   chain_step: number;
   chain_max_extra: number;
+  dominance_weight: number;
+  dominance_cap: number;
+  dominance_min_category: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -97,9 +111,12 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 365,
   chain_step: 0.01,
   chain_max_extra: 9,
+  dominance_weight: 0.1,
+  dominance_cap: 0.5,
+  dominance_min_category: 3,
 };
 
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** Live-token view: the largest live protocols by market cap. */
 export const LIVE_ROWS = 24;
@@ -118,6 +135,9 @@ export interface ModelBreakdown {
   chain_multiplier: number;
   chain_count: number;
   age_days: number | null;
+  dominance_multiplier: number;
+  category_share: number;
+  category_size: number;
 }
 
 export interface BoardRow {
@@ -184,6 +204,8 @@ export interface RadarData {
   excluded_house: number;
   /** Board rows whose rank sits 5+ places from their TVL-only rank: the model is not a TVL table. */
   rank_moved_5plus: number;
+  /** Risk steps (farm step 5) that carry no figure from the protocol's own record: 0 in radar-4, every branch names its figures. */
+  generic_risk_steps: number;
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -211,8 +233,31 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
-/** radar-2 scoring of one protocol, with every factor exposed for the detail view. */
-export function impliedValue(p: SnapshotProtocol, asOf: string, model: ModelConstants = MODEL): { implied: number; breakdown: ModelBreakdown } {
+/** Per-category totals from the snapshot, for the category-lead factor. */
+export interface CategoryStats {
+  total_tvl: number;
+  count: number;
+}
+
+export function categoryStats(snapshot: Snapshot): Map<string, CategoryStats> {
+  const stats = new Map<string, CategoryStats>();
+  for (const p of snapshot.protocols) {
+    const key = p.category ?? '';
+    const s = stats.get(key) ?? { total_tvl: 0, count: 0 };
+    s.total_tvl += p.tvl_usd;
+    s.count += 1;
+    stats.set(key, s);
+  }
+  return stats;
+}
+
+/** radar-4 scoring of one protocol, with every factor exposed for the detail view. */
+export function impliedValue(
+  p: SnapshotProtocol,
+  asOf: string,
+  model: ModelConstants = MODEL,
+  cats: Map<string, CategoryStats> | null = null,
+): { implied: number; breakdown: ModelBreakdown } {
   const age = ageDays(asOf, p.listed_at);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, finite(p.change_7d, 0)));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
@@ -220,8 +265,18 @@ export function impliedValue(p: SnapshotProtocol, asOf: string, model: ModelCons
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainCount = Array.isArray(p.chains) ? p.chains.length : 0;
   const chainMult = 1 + Math.min(Math.max(chainCount - 1, 0), model.chain_max_extra) * model.chain_step;
+  // Category lead, radar-4: the protocol's share of its own category's TVL.
+  // Only when the category holds 3+ protocols in the snapshot, so a
+  // one-protocol category cannot manufacture a lead out of nothing.
+  const stat = cats?.get(p.category ?? '');
+  const categorySize = stat?.count ?? 0;
+  const categoryShare = stat && stat.total_tvl > 0 ? p.tvl_usd / stat.total_tvl : 0;
+  const dominanceMult =
+    categorySize >= model.dominance_min_category
+      ? 1 + Math.min(categoryShare, model.dominance_cap) * model.dominance_weight
+      : 1;
   const base = p.tvl_usd * model.base_multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult));
+  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult * dominanceMult));
   return {
     implied,
     breakdown: {
@@ -232,6 +287,9 @@ export function impliedValue(p: SnapshotProtocol, asOf: string, model: ModelCons
       chain_multiplier: round4(chainMult),
       chain_count: chainCount,
       age_days: age,
+      dominance_multiplier: round4(dominanceMult),
+      category_share: round4(categoryShare),
+      category_size: categorySize,
     },
   };
 }
@@ -301,8 +359,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
   for (const p of early) chosen.set(p.slug, p);
 
+  const cats = categoryStats(snapshot);
   const scored = [...chosen.values()].map((p) => {
-    const { implied, breakdown } = impliedValue(p, snapshot.as_of, model);
+    const { implied, breakdown } = impliedValue(p, snapshot.as_of, model, cats);
     return { p, implied, breakdown };
   });
   // Rank by implied value; exact ties break by TVL, then slug: deterministic.
@@ -407,15 +466,37 @@ function weeklyAction(p: SnapshotProtocol): string {
   return 'make one real transaction in the app, such as a deposit, a swap or a vote';
 }
 
+/** Short dollar figure for a risk step, e.g. $2.75B, $150.2M, $8,400. */
+function moneyShort(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (abs >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
+  return `$${Math.round(n)}`;
+}
+
 /**
- * The risk check: one step that only this protocol's own figures can write.
- * A falling TVL, a surging TVL, a very long wait with no token, or a wide
- * chain spread each change what the farmer should do next, so the step
- * says which one applies and what to do about it.
+ * The risk check, radar-4: one step that only this protocol's own figures
+ * can write. radar-3 had four signals (a falling TVL, a surging TVL, a very
+ * long wait with no token, a wide chain spread) and 113 of 178 rows fell
+ * through to a generic announcement check. radar-4 reads every figure the
+ * snapshot carries, in priority order, so each row gets the risk that
+ * actually applies to it: a sharp fall, a steady fall, a surge, a long wait,
+ * a young protocol, a slow TVL drift, a single-chain position, a thin TVL,
+ * missing momentum data, or a wide chain spread. The last branch is the
+ * steady state, and it still names the row's own figures (its 7-day change,
+ * its age, its chain count), so no row ends on a generic step.
  */
 function riskStep(p: SnapshotProtocol, age: number | null, capital: number): FarmStep {
   const change = p.change_7d;
   const chains = Array.isArray(p.chains) ? p.chains.length : 0;
+  if (change !== null && change <= -25) {
+    return {
+      text: `TVL fell sharply, ${Math.abs(change).toFixed(1)}% in the last 7 days: stop adding capital, keep only the $${capital} already in, and do not top it up until two snapshots in a row show the fall stopping.`,
+      cost: 'no new capital; about $2 of gas to check',
+      time: '10 minutes a week until the fall stops',
+    };
+  }
   if (change !== null && change <= -10) {
     return {
       text: `TVL fell ${Math.abs(change).toFixed(1)}% in the last 7 days, so do not add more capital yet: keep the $${capital} position, check the protocol's own announcements for the cause, and only top it up if the next snapshot shows the fall reversing.`,
@@ -437,6 +518,41 @@ function riskStep(p: SnapshotProtocol, age: number | null, capital: number): Far
       time: 'no extra time, but no quick exit either',
     };
   }
+  if (age !== null && age < 180) {
+    return {
+      text: `Listed only ${age} days ago with no token yet, so the record is short and the farm is unproven: keep to the planned $${capital}, expect a snapshot to miss a week, and do not judge the farm by its first month.`,
+      cost: `the $${capital} stays locked; nothing extra to pay`,
+      time: '10 minutes a week',
+    };
+  }
+  if (change !== null && change < 0) {
+    return {
+      text: `TVL drifted down ${Math.abs(change).toFixed(1)}% in the last 7 days: not a crash, but a slow bleed, so hold the $${capital} position, add nothing, and check again next week; two more down weeks in a row means the protocol is cooling off.`,
+      cost: 'no new capital; about $2 of gas to check',
+      time: '10 minutes a week',
+    };
+  }
+  if (chains === 1) {
+    return {
+      text: `Live on only one chain (${chainOf(p)}), so the whole position depends on that chain staying usable: keep the $${capital} modest, and if the chain has an outage, do not move the position until it is back.`,
+      cost: `the $${capital} stays in one place; nothing extra to pay`,
+      time: 'no extra time',
+    };
+  }
+  if (p.tvl_usd < 10_000_000) {
+    return {
+      text: `TVL is only ${moneyShort(p.tvl_usd)}, so the pool is thin: one large withdrawal can move the price against you, so enter and exit in two parts and never put the whole $${capital} in at once.`,
+      cost: 'about $2 of extra gas for the split entry',
+      time: '15 minutes to split the entry',
+    };
+  }
+  if (change === null) {
+    return {
+      text: `No 7-day change is recorded for this protocol, so momentum is unknown: farm the planned $${capital}, but treat the first two snapshots as the real test and be ready to stop if TVL turns down.`,
+      cost: `the $${capital} stays locked; nothing extra to pay`,
+      time: '10 minutes a week',
+    };
+  }
   if (chains >= 10) {
     return {
       text: `Live on ${chains} chains, so repeat the core action once on a second chain (${p.chains[1]}), keeping the same wallet for both, so the wallet is counted on more than one chain.`,
@@ -444,8 +560,10 @@ function riskStep(p: SnapshotProtocol, age: number | null, capital: number): Far
       time: '15 minutes, once',
     };
   }
+  const ageText = age === null ? 'listed at an unknown date' : `listed ${age} days ago`;
+  const changeText = change === null ? 'unreported' : `${change > 0 ? '+' : ''}${change.toFixed(1)}%`;
   return {
-    text: `Check the protocol's own announcements once a week for a points program or a launch date: a program that opens after you deposit still counts the position, but only if the wallet already holds it.`,
+    text: `No warning in the snapshot: TVL moved ${changeText} in 7 days, ${ageText} with no token, and live on ${chains} chains. The risk is a quiet wind-down, so check the protocol's own announcements once a week; a slow protocol can stop without a visible TVL fall.`,
     cost: 'nothing to check',
     time: '5 minutes a week',
   };
@@ -551,13 +669,17 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const tvlOrder = [...board].sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1));
   const tvlRank = new Map(tvlOrder.map((r, i) => [r.slug, i + 1]));
   const rankMoved5plus = board.filter((r) => Math.abs(r.rank - (tvlRank.get(r.slug) ?? r.rank)) >= 5).length;
+  // A risk step is generic when it carries no figure from the protocol's
+  // own record (no number at all in the step). radar-4's ladder names a
+  // figure in every branch, so this is 0; the self-checker asserts it.
+  const genericRiskSteps = board.filter((r) => !/\d/.test(r.farm_steps[4] ?? '')).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
-    model_formula: 'implied = TVL x 0.25 x (1 + clamp(change_7d, -60, 120) / 100 x 0.5) x (0.6 + min(age, 1095) / 1095 x 0.4) x (1 + min(chains - 1, 9) x 0.01)',
+    model_formula: 'implied = TVL x 0.25 x (1 + clamp(change_7d, -60, 120) / 100 x 0.5) x (0.6 + min(age, 1095) / 1095 x 0.4) x (1 + min(chains - 1, 9) x 0.01) x (1 + min(category share, 0.5) x 0.1, only when the category holds 3+ protocols)',
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
@@ -566,6 +688,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     excluded_visible: excludedVisible,
     excluded_house: excludedHouse,
     rank_moved_5plus: rankMoved5plus,
+    generic_risk_steps: genericRiskSteps,
     rows: board.map(radarRow),
     live,
   };
